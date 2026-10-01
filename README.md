@@ -12,7 +12,7 @@ are generated mirrors, not places to commit.
 | Package | Framework | Language | Status |
 |---|---|---|---|
 | [`langgraph-checkpoint-documentdb`](packages/langgraph-checkpoint-documentdb) | LangGraph | Python | in development |
-| `vercel-ai-memory-documentdb` | Vercel AI SDK | TypeScript | planned |
+| [`vercel-ai-memory-documentdb`](packages/vercel-ai-memory-documentdb) | Vercel AI SDK | TypeScript | in development |
 
 Phase 2 targets: CrewAI, Pydantic AI, OpenAI Agents SDK sessions, Semantic Kernel.
 

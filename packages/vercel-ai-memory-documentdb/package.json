@@ -1,0 +1,49 @@
+{
+  "name": "vercel-ai-memory-documentdb",
+  "version": "0.1.0",
+  "description": "Vercel AI SDK memory adapter backed by Azure DocumentDB (works against the local documentdb container too)",
+  "license": "MIT",
+  "author": "Azure DocumentDB",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "vercel-ai-sdk",
+    "documentdb",
+    "azure",
+    "agent",
+    "memory",
+    "vector-search"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Azure-DocumentDB/documentdb-agent-memory.git",
+    "directory": "packages/vercel-ai-memory-documentdb"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 --experimental-strip-types test/*.test.ts"
+  },
+  "dependencies": {
+    "mongodb": "^6.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}

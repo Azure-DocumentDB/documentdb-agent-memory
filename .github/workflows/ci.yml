@@ -66,3 +66,62 @@ jobs:
           DOCUMENTDB_USERNAME: appuser
           DOCUMENTDB_PASSWORD: ci-local-Aa1-not-a-secret
         run: pytest -q
+
+  vercel-ai:
+    name: vercel-ai-memory-documentdb (node${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20", "22"]
+
+    services:
+      documentdb:
+        image: ghcr.io/documentdb/documentdb/documentdb-local:latest
+        ports:
+          - 10260:10260
+        env:
+          USERNAME: appuser
+          # CI-only throwaway credential for an ephemeral container that is
+          # destroyed with the runner. Not a secret, and not reused anywhere.
+          PASSWORD: ci-local-Aa1-not-a-secret
+
+    defaults:
+      run:
+        working-directory: packages/vercel-ai-memory-documentdb
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Wait for DocumentDB
+        run: |
+          for i in $(seq 1 30); do
+            if node -e '
+              const { MongoClient } = require("mongodb");
+              const pw = encodeURIComponent("ci-local-Aa1-not-a-secret");
+              const uri = `mongodb://appuser:${pw}@127.0.0.1:10260/`
+                + "?tls=true&tlsAllowInvalidCertificates=true"
+                + "&directConnection=true&authMechanism=SCRAM-SHA-256";
+              new MongoClient(uri, { serverSelectionTimeoutMS: 3000 })
+                .db("admin").command({ ping: 1 })
+                .then(() => process.exit(0), () => process.exit(1));
+            '; then echo "ready"; exit 0; fi
+            echo "[$i] waiting..."; sleep 10
+          done
+          echo "DocumentDB never became ready"; exit 1
+
+      - name: Test
+        env:
+          DOCUMENTDB_USERNAME: appuser
+          DOCUMENTDB_PASSWORD: ci-local-Aa1-not-a-secret
+        run: npm test
