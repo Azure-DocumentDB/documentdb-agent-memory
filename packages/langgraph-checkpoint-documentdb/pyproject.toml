@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langgraph-checkpoint-documentdb"
+version = "0.1.0"
+description = "LangGraph checkpointer backed by Azure DocumentDB (works against the local documentdb container too)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Azure DocumentDB" }]
+keywords = ["langgraph", "documentdb", "azure", "agent", "memory", "checkpointer"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Intended Audience :: Developers",
+]
+dependencies = ["pymongo>=4.6,<5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2"]
+
+[project.urls]
+Homepage = "https://github.com/Azure-DocumentDB/documentdb-agent-memory"
+Source = "https://github.com/Azure-DocumentDB/documentdb-agent-memory"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/langgraph_checkpoint_documentdb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
+markers = ["integration: requires a running DocumentDB instance"]

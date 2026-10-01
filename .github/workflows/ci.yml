@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  langgraph:
+    name: langgraph-checkpoint-documentdb (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    services:
+      documentdb:
+        image: ghcr.io/documentdb/documentdb/documentdb-local:latest
+        ports:
+          - 10260:10260
+        env:
+          USERNAME: appuser
+          # CI-only throwaway credential for an ephemeral container that is
+          # destroyed with the runner. Not a secret, and not reused anywhere.
+          PASSWORD: ci-local-Aa1-not-a-secret
+
+    defaults:
+      run:
+        working-directory: packages/langgraph-checkpoint-documentdb
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Wait for DocumentDB
+        run: |
+          for i in $(seq 1 30); do
+            if python - <<'PY'
+          import os, sys, urllib.parse
+          from pymongo import MongoClient
+          pw = urllib.parse.quote_plus("ci-local-Aa1-not-a-secret")
+          uri = (f"mongodb://appuser:{pw}@127.0.0.1:10260/"
+                 "?tls=true&tlsAllowInvalidCertificates=true"
+                 "&directConnection=true&authMechanism=SCRAM-SHA-256")
+          try:
+              MongoClient(uri, serverSelectionTimeoutMS=3000).admin.command("ping")
+          except Exception:
+              sys.exit(1)
+          PY
+            then echo "ready"; exit 0; fi
+            echo "[$i] waiting..."; sleep 10
+          done
+          echo "DocumentDB never became ready"; exit 1
+
+      - name: Test
+        env:
+          DOCUMENTDB_USERNAME: appuser
+          DOCUMENTDB_PASSWORD: ci-local-Aa1-not-a-secret
+        run: pytest -q

@@ -1,0 +1,17 @@
+services:
+  documentdb:
+    image: ghcr.io/documentdb/documentdb/documentdb-local:latest
+    container_name: documentdb-agent-memory
+    ports:
+      # Bound to loopback on purpose: this container has no network ACLs and
+      # the credentials below are developer-chosen. Do not expose it on 0.0.0.0.
+      - "127.0.0.1:${DOCUMENTDB_PORT:-10260}:10260"
+    environment:
+      USERNAME: ${DOCUMENTDB_USERNAME:?set DOCUMENTDB_USERNAME}
+      PASSWORD: ${DOCUMENTDB_PASSWORD:?set DOCUMENTDB_PASSWORD}
+    volumes:
+      - documentdb-data:/data
+    restart: unless-stopped
+
+volumes:
+  documentdb-data:
