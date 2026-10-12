@@ -1,6 +1,6 @@
 {
   "name": "vercel-ai-memory-documentdb",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Application-level AI SDK message memory backed by Azure DocumentDB",
   "license": "MIT",
   "author": "Azure DocumentDB",
