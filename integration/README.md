@@ -13,9 +13,9 @@ Offline tests validate only harness guards, environment translation and syntax.
   and read/write/delete test records. Database names are always generated as
   `readiness_memory_cross_<24-random-hex>_pyts` and `_tspy`; the harness cannot
   target a user-supplied existing database.
-- Existing Python venv with this package's locked dependencies. The readiness
-  workspace defaults to `../python-evidence/venv/bin/python` from repository root.
-  Else set `MEMORY_CROSS_PYTHON=/absolute/path/to/venv/bin/python` or `--python`.
+- An activated Python venv with the Python package's locked dependencies installed.
+  The coordinator defaults to the Python executable used to launch it. You can
+  override it with `MEMORY_CROSS_PYTHON=/absolute/path/to/venv/bin/python` or `--python`.
 - Built TypeScript `packages/vercel-ai-memory-documentdb/dist` and that package's
   local `node_modules`, Node >=24.21.0. Build with the package's existing build
   command before execution. This harness never installs global or local deps.
@@ -24,7 +24,7 @@ Offline tests validate only harness guards, environment translation and syntax.
 
 The coordinator resolves Python package source and TypeScript `dist` relative to
 its own location, not the caller's current directory. Package compilation is the
-parent's responsibility, so build after any TypeScript source changes.
+caller's responsibility, so build after any TypeScript source changes.
 
 ## Authentication: privately inject one configuration
 
@@ -66,16 +66,15 @@ is not evidence for the other: run separately for native and OIDC.
 Offline only (no cloud connections):
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 ../python-evidence/venv/bin/python \
+PYTHONDONTWRITEBYTECODE=1 python \
   -m unittest discover -s integration -p 'test_offline.py' -v
 ```
 
-After the parent has approved Azure calls and privately injected auth:
+After approving your own disposable Azure test resources and privately configuring auth:
 
 ```sh
-MEMORY_CROSS_LIVE=1 ../python-evidence/venv/bin/python \
-  integration/coordinator.py \
-  --output ../cross-evidence/live-native.json
+MEMORY_CROSS_LIVE=1 python integration/coordinator.py \
+  --output /path/outside-the-repo/live-native.json
 ```
 
 Use `live-oidc.json` for the separate OIDC run. Never enable the live variable for

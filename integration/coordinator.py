@@ -118,7 +118,7 @@ def run_worker(language: str, request: dict, env: dict, python: str, timeout: in
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--python', default=os.environ.get('MEMORY_CROSS_PYTHON', str(ROOT.parent / 'python-evidence/venv/bin/python')), help='Existing project venv; never installs dependencies')
+    parser.add_argument('--python', default=os.environ.get('MEMORY_CROSS_PYTHON', sys.executable), help='Existing project venv; never installs dependencies')
     parser.add_argument('--output', type=Path, help='Optional credential-free JSON evidence file')
     args = parser.parse_args()
     token = uuid.uuid4().hex[:24]
