@@ -1,7 +1,7 @@
 services:
   documentdb:
-    image: ghcr.io/documentdb/documentdb/documentdb-local:latest
-    container_name: documentdb-agent-memory
+    # Explicit optional local evaluation image; see TESTED.md for validation scope.
+    image: ghcr.io/documentdb/documentdb/documentdb-local:pg17-1.0-rc2@sha256:906670c630fc94e97b310a4951c5c0b81cb2853de4ccb21f75808031d4e2714d
     ports:
       # Bound to loopback on purpose: this container has no network ACLs and
       # the credentials below are developer-chosen. Do not expose it on 0.0.0.0.
@@ -9,9 +9,11 @@ services:
     environment:
       USERNAME: ${DOCUMENTDB_USERNAME:?set DOCUMENTDB_USERNAME}
       PASSWORD: ${DOCUMENTDB_PASSWORD:?set DOCUMENTDB_PASSWORD}
+      DOCUMENTDB_USAGE_TELEMETRY: "0"
+      ENABLE_TELEMETRY: "false"
     volumes:
       - documentdb-data:/data
-    restart: unless-stopped
+    restart: "no"
 
 volumes:
   documentdb-data:

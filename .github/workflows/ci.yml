@@ -1,135 +1,88 @@
-name: ci
-
+name: Framework, package and security checks
 on:
   push:
-    branches: [main]
   pull_request:
-
+permissions:
+  contents: read
 jobs:
-  langgraph:
-    name: langgraph-checkpoint-documentdb (py${{ matrix.python-version }})
+  python:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.12"]
-
-    services:
-      documentdb:
-        # Pinned by digest, not :latest. An upstream image bump would otherwise
-        # land silently and look like a regression in our code. Resolve a new
-        # digest with:
-        #   docker buildx imagetools inspect ghcr.io/documentdb/documentdb/documentdb-local:latest
-        image: ghcr.io/documentdb/documentdb/documentdb-local@sha256:a22772de11861a97d395eecdbe6fbaedd245498b015e748ca409f526430ca781
-        ports:
-          - 10260:10260
-        env:
-          USERNAME: appuser
-          # CI-only throwaway credential for an ephemeral container that is
-          # destroyed with the runner. Not a secret, and not reused anywhere.
-          PASSWORD: ci-local-Aa1-not-a-secret
-
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: packages/langgraph-checkpoint-documentdb
-
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.13'
+      - run: python -m pip install --require-hashes -r requirements-dev.lock
+      - run: python -m pip install --no-build-isolation --no-deps -e .
+      - run: python -m pip check
+      - name: Genuine framework and offline database contracts
+        run: python -m pytest -q
+      - name: Build distribution artifacts
+        run: python -m build --no-isolation
+      - name: Verify wheel installation instead of source import
         run: |
-          python -m pip install --upgrade pip
-          pip install -e '.[dev]'
-
-      - name: Wait for DocumentDB
+          python -m pip uninstall -y langgraph-checkpoint-documentdb
+          python -m pip install --no-deps dist/*.whl
+          cd /tmp
+          python -c 'from langgraph_checkpoint_documentdb import DocumentDBSaver; from langgraph.checkpoint.base import BaseCheckpointSaver; assert issubclass(DocumentDBSaver, BaseCheckpointSaver)'
+      - name: Audit locked dependencies
+        run: python -m pip_audit -r requirements-dev.lock --require-hashes
+      - name: Cross-process coordinator offline guards
+        working-directory: .
+        run: python -m unittest discover -s integration -p 'test_offline.py'
+      - name: Explicit live gate must reject missing consent
+        shell: bash
         run: |
-          for i in $(seq 1 30); do
-            if python - <<'PY'
-          import os, sys, urllib.parse
-          from pymongo import MongoClient
-          pw = urllib.parse.quote_plus("ci-local-Aa1-not-a-secret")
-          uri = (f"mongodb://appuser:{pw}@127.0.0.1:10260/"
-                 "?tls=true&tlsAllowInvalidCertificates=true"
-                 "&directConnection=true&authMechanism=SCRAM-SHA-256")
-          try:
-              MongoClient(uri, serverSelectionTimeoutMS=3000).admin.command("ping")
-          except Exception:
-              sys.exit(1)
-          PY
-            then echo "ready"; exit 0; fi
-            echo "[$i] waiting..."; sleep 10
-          done
-          echo "DocumentDB never became ready"; exit 1
-
-      - name: Test
-        env:
-          DOCUMENTDB_USERNAME: appuser
-          DOCUMENTDB_PASSWORD: ci-local-Aa1-not-a-secret
-        run: pytest -q
-
-  vercel-ai:
-    name: vercel-ai-memory-documentdb (node${{ matrix.node-version }})
+          if env -u DOCUMENTDB_LIVE python -m pytest -q --live >live-refusal.log 2>&1; then
+            echo 'Live gate unexpectedly accepted missing consent'
+            exit 1
+          fi
+          grep -q 'Live gate requires DOCUMENTDB_LIVE=1' live-refusal.log
+  typescript:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version: ["20", "22"]
-
-    services:
-      documentdb:
-        # Pinned by digest, not :latest. An upstream image bump would otherwise
-        # land silently and look like a regression in our code. Resolve a new
-        # digest with:
-        #   docker buildx imagetools inspect ghcr.io/documentdb/documentdb/documentdb-local:latest
-        image: ghcr.io/documentdb/documentdb/documentdb-local@sha256:a22772de11861a97d395eecdbe6fbaedd245498b015e748ca409f526430ca781
-        ports:
-          - 10260:10260
-        env:
-          USERNAME: appuser
-          # CI-only throwaway credential for an ephemeral container that is
-          # destroyed with the runner. Not a secret, and not reused anywhere.
-          PASSWORD: ci-local-Aa1-not-a-secret
-
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: packages/vercel-ai-memory-documentdb
-
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          node-version: ${{ matrix.node-version }}
-
-      - name: Install
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Wait for DocumentDB
-        run: |
-          for i in $(seq 1 30); do
-            if node -e '
-              const { MongoClient } = require("mongodb");
-              const pw = encodeURIComponent("ci-local-Aa1-not-a-secret");
-              const uri = `mongodb://appuser:${pw}@127.0.0.1:10260/`
-                + "?tls=true&tlsAllowInvalidCertificates=true"
-                + "&directConnection=true&authMechanism=SCRAM-SHA-256";
-              new MongoClient(uri, { serverSelectionTimeoutMS: 3000 })
-                .db("admin").command({ ping: 1 })
-                .then(() => process.exit(0), () => process.exit(1));
-            '; then echo "ready"; exit 0; fi
-            echo "[$i] waiting..."; sleep 10
-          done
-          echo "DocumentDB never became ready"; exit 1
-
-      - name: Test
-        env:
-          DOCUMENTDB_USERNAME: appuser
-          DOCUMENTDB_PASSWORD: ci-local-Aa1-not-a-secret
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.21.0'
+          cache: npm
+          cache-dependency-path: packages/vercel-ai-memory-documentdb/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Compiled tests and actual AI SDK mock-model wiring
         run: npm test
+      - run: npm audit --audit-level=low
+      - run: npm audit --omit=dev --audit-level=low
+      - name: Verify package tarball installation
+        shell: bash
+        run: |
+          archive="$(npm pack --silent)"
+          package="$PWD/$archive"
+          temp="$(mktemp -d)"
+          cd "$temp"
+          npm init -y >/dev/null
+          npm install --ignore-scripts "$package"
+          node --input-type=module -e 'import {DocumentDBMemory} from "vercel-ai-memory-documentdb"; if (typeof DocumentDBMemory !== "function") process.exit(1)'
+      - name: Explicit live gate must reject missing consent
+        shell: bash
+        run: |
+          if env -u MEMORY_LIVE_ALLOW_WRITES -u MEMORY_TEST_DATABASE npm run test:live >live-refusal.log 2>&1; then
+            echo 'Live gate unexpectedly accepted missing consent'
+            exit 1
+          fi
+          grep -q 'Live gate requires MEMORY_LIVE_ALLOW_WRITES=true' live-refusal.log
+# No Azure credentials, live model calls, resource provisioning, database drops,
+# package registry uploads or visibility changes are performed by these jobs.
+# Managed and cross-process database acceptance evidence is recorded in TESTED.md.

@@ -1,174 +1,96 @@
-"""Vector index helpers for Azure DocumentDB / documentdb-local.
-
-Everything in here exists because of empirically verified behavior, not docs.
-See docs/VECTOR_INDEXES.md for the test matrix that produced these rules.
-
-Two rules drive this module:
-
-1. IVF is the only index kind that works on BOTH the local container and the
-   entry-level managed tier (M10). HNSW is present locally but tier-gated in the
-   cloud (M30+); DiskANN is absent locally and tier-gated in the cloud (M40+).
-   So IVF is the default. Anything else is opt-in and may fail on deploy.
-
-2. Pre-filtered vector search requires a plain index on the filter field, and it
-   must exist BEFORE the search runs. Without it the server returns
-   "The index for filter path 'X' was not found". Per-session memory retrieval is
-   exactly the pre-filter case, so we always create it.
-"""
-
+"""Validated Azure DocumentDB vector helpers. Availability is deployment-specific."""
 from __future__ import annotations
-
 from dataclasses import dataclass
+import math
 from typing import Any, Iterable, Literal
-
 from pymongo.database import Database
 from pymongo.errors import OperationFailure
 
-VectorKind = Literal["vector-ivf", "vector-hnsw", "vector-diskann"]
-
-DEFAULT_KIND: VectorKind = "vector-ivf"
-
-# Minimum managed cluster tier for each kind. Local container support differs and
-# is tracked separately -- see LOCAL_SUPPORTED.
-MIN_TIER: dict[VectorKind, str] = {
-    "vector-ivf": "M10",
-    "vector-hnsw": "M30",
-    "vector-diskann": "M40",
-}
-
-# Verified against ghcr.io/documentdb/documentdb/documentdb-local (0.117.0).
-LOCAL_SUPPORTED: dict[VectorKind, bool] = {
-    "vector-ivf": True,
-    "vector-hnsw": True,
-    "vector-diskann": False,
-}
+VectorKind = Literal['vector-ivf', 'vector-hnsw', 'vector-diskann']
+DEFAULT_KIND: VectorKind = 'vector-ivf'
 
 
 class VectorIndexUnsupported(RuntimeError):
-    """Raised when the target cluster rejects an index kind.
-
-    Carries the remediation inline because the server message alone
-    ("hnsw index is not supported for this cluster tier") does not say which
-    tier is required.
-    """
+    pass
 
 
 @dataclass(frozen=True)
 class VectorIndexSpec:
-    """Declarative vector index definition."""
-
     path: str
     dimensions: int
     kind: VectorKind = DEFAULT_KIND
-    similarity: Literal["COS", "L2", "IP"] = "COS"
-    # IVF
-    num_lists: int = 100
-    # HNSW
+    similarity: Literal['COS', 'L2', 'IP'] = 'COS'
+    num_lists: int = 1
     m: int = 16
     ef_construction: int = 64
-    # DiskANN
     max_degree: int = 32
     l_build: int = 50
 
+    def __post_init__(self):
+        if not isinstance(self.path, str) or not self.path or self.path.startswith('$') or '\x00' in self.path:
+            raise ValueError('invalid vector path')
+        if self.kind not in ('vector-ivf', 'vector-hnsw', 'vector-diskann') or self.similarity not in ('COS', 'L2', 'IP'):
+            raise ValueError('invalid vector kind/similarity')
+        for value in (self.dimensions, self.num_lists, self.m, self.ef_construction, self.max_degree, self.l_build):
+            if type(value) is not int or value <= 0:
+                raise ValueError('vector dimensions/index parameters must be positive integers')
+
     def cosmos_search_options(self) -> dict[str, Any]:
-        opts: dict[str, Any] = {
-            "kind": self.kind,
-            "similarity": self.similarity,
-            "dimensions": self.dimensions,
-        }
-        if self.kind == "vector-ivf":
-            opts["numLists"] = self.num_lists
-        elif self.kind == "vector-hnsw":
-            opts["m"] = self.m
-            opts["efConstruction"] = self.ef_construction
-        elif self.kind == "vector-diskann":
-            opts["maxDegree"] = self.max_degree
-            opts["lBuild"] = self.l_build
+        opts = {'kind': self.kind, 'similarity': self.similarity, 'dimensions': self.dimensions}
+        if self.kind == 'vector-ivf':
+            opts['numLists'] = self.num_lists
+        elif self.kind == 'vector-hnsw':
+            opts.update(m=self.m, efConstruction=self.ef_construction)
+        else:
+            opts.update(maxDegree=self.max_degree, lBuild=self.l_build)
         return opts
 
 
-def _is_unsupported_kind_error(exc: OperationFailure) -> bool:
-    msg = str(exc)
-    return (
-        "not supported for this cluster tier" in msg
-        or "is not enabled for this cluster tier" in msg
-        or "Invalid search index kind" in msg
-    )
+def validate_vector_catalog(db: Database, collection: str, spec: VectorIndexSpec, *, name: str | None = None) -> None:
+    expected_name = name or f'{spec.path}_{spec.kind.replace("-", "_")}'
+    for idx in db[collection].list_indexes():
+        key = dict(idx['key'])
+        if idx['name'] == expected_name or 'cosmosSearch' in key.values():
+            options = idx.get('cosmosSearchOptions', {})
+            expected = spec.cosmos_search_options()
+            if idx['name'] != expected_name or key != {spec.path: 'cosmosSearch'} or options != expected or idx.get('unique') or idx.get('sparse') or idx.get('partialFilterExpression') or 'expireAfterSeconds' in idx:
+                raise ValueError('Incompatible vector catalog; use a new database or migrate offline. No index was dropped.')
 
 
-def ensure_filter_indexes(
-    db: Database, collection: str, fields: Iterable[str]
-) -> list[str]:
-    """Create plain indexes for every field used as a vector pre-filter.
-
-    Must run before any filtered ``$search``. Idempotent.
-    """
-    created: list[str] = []
+def ensure_filter_indexes(db: Database, collection: str, fields: Iterable[str]) -> list[str]:
+    result = []
     for field in fields:
-        name = f"{field}_filter"
-        try:
-            db.command(
-                {
-                    "createIndexes": collection,
-                    "indexes": [{"name": name, "key": {field: 1}}],
-                }
-            )
-            created.append(name)
-        except OperationFailure as exc:
-            # Index already present in an equivalent form is not an error.
-            if "already exists" not in str(exc):
-                raise
-    return created
+        if not isinstance(field, str) or not field or field.startswith('$'):
+            raise ValueError('invalid filter field')
+        name = f'{field}_filter'
+        db[collection].create_index([(field, 1)], name=name)
+        result.append(name)
+    return result
 
 
-def ensure_vector_index(
-    db: Database,
-    collection: str,
-    spec: VectorIndexSpec,
-    *,
-    name: str | None = None,
-) -> str:
-    """Create a vector index, translating tier rejections into actionable errors."""
-    index_name = name or f"{spec.path}_{spec.kind.replace('-', '_')}"
+def ensure_vector_index(db: Database, collection: str, spec: VectorIndexSpec, *, name: str | None = None) -> str:
+    index_name = name or f'{spec.path}_{spec.kind.replace("-", "_")}'
+    validate_vector_catalog(db, collection, spec, name=index_name)
+    if any(idx['name'] == index_name for idx in db[collection].list_indexes()):
+        return index_name
     try:
-        db.command(
-            {
-                "createIndexes": collection,
-                "indexes": [
-                    {
-                        "name": index_name,
-                        "key": {spec.path: "cosmosSearch"},
-                        "cosmosSearchOptions": spec.cosmos_search_options(),
-                    }
-                ],
-            }
-        )
+        db.command({'createIndexes': collection, 'indexes': [{'name': index_name, 'key': {spec.path: 'cosmosSearch'}, 'cosmosSearchOptions': spec.cosmos_search_options()}]})
     except OperationFailure as exc:
-        if _is_unsupported_kind_error(exc):
-            raise VectorIndexUnsupported(
-                f"Vector index kind {spec.kind!r} was rejected by this deployment.\n"
-                f"  Managed Azure DocumentDB: requires tier {MIN_TIER[spec.kind]} or higher.\n"
-                f"  Local documentdb-local container: "
-                f"{'supported' if LOCAL_SUPPORTED[spec.kind] else 'NOT supported'}.\n"
-                f"  {DEFAULT_KIND!r} works on both the local container and every managed "
-                f"tier from {MIN_TIER[DEFAULT_KIND]} up, and is the default.\n"
-                f"  Server said: {exc}"
-            ) from exc
-        if "already exists" in str(exc):
-            return index_name
+        if any(msg in str(exc) for msg in ('not supported', 'not enabled', 'Invalid search index kind')):
+            raise VectorIndexUnsupported(f'{spec.kind} unavailable on this deployment; verify current Azure tier/region support. IVF is the default.') from exc
         raise
     return index_name
 
 
-def vector_search_stage(
-    *,
-    vector: list[float],
-    path: str,
-    k: int,
-    filter: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Build a ``$search`` stage for cosmosSearch vector similarity."""
-    inner: dict[str, Any] = {"vector": vector, "path": path, "k": k}
-    if filter:
-        inner["filter"] = filter
-    return {"$search": {"cosmosSearch": inner}}
+def vector_search_stage(*, vector: list[float], path: str = 'embedding', k: int, namespace: str, thread_id: str, dimensions: int | None = None) -> dict[str, Any]:
+    from .schema import text
+    text(namespace, 'namespace')
+    text(thread_id, 'thread_id')
+    text(path, 'path')
+    if not isinstance(vector, list) or not vector or any(type(v) not in (int, float) or not math.isfinite(v) for v in vector):
+        raise ValueError('vector must be a nonempty finite numeric list')
+    if dimensions is not None and (type(dimensions) is not int or dimensions < 1 or len(vector) != dimensions):
+        raise ValueError('vector dimensions mismatch')
+    if type(k) is not int or not 1 <= k <= 1000:
+        raise ValueError('k must be an integer between 1 and 1000')
+    return {'$search': {'cosmosSearch': {'vector': vector, 'path': path, 'k': k, 'filter': {'namespace': {'$eq': namespace}, 'thread_id': {'$eq': thread_id}}}}}
