@@ -1,85 +1,29 @@
-# Vector indexes on Azure DocumentDB
+# Vector indexes and scoped recall
 
-Everything here is from running the same probe against both a local
-`documentdb-local` container and a managed Azure DocumentDB M10 cluster. Where
-docs and observed behavior disagreed, observed behavior won.
+The adapters store embeddings supplied by the application; they do not call an embedding model. Stored and query vectors must have the configured dimensions, finite numeric values and the same embedding space. Synthetic vectors used by tests prove query behavior, not semantic relevance.
 
-## Support matrix
+## Defaults and deployment support
 
-| Kind | Local container (0.117.0) | Managed M10 | Minimum managed tier |
-|---|---|---|---|
-| `vector-ivf` | ✅ create + search | ✅ create + search | M10 |
-| `vector-hnsw` | ✅ create + search | ❌ rejected | M30 |
-| `vector-diskann` | ❌ not in build | ❌ rejected | M40 |
+The small-memory validation configuration uses an IVF index (`vector-ivf`, cosine similarity, `numLists=1`). This is a demonstration default, not production index tuning. Check the current service documentation and the specific environment before selecting a different index.
 
-Both report `buildInfo.version` `7.0.0` and `maxWireVersion` 21.
+Earlier experiments in this project used local DocumentDB0.117 and a managed M10 cluster: IVF worked in both; HNSW worked locally but was rejected by M10; DiskANN was absent in that local build. Those observations are historical, not universal guarantees. Separate October12,2026 vector-sample tests verified IVF, HNSW and DiskANN on managed Azure DocumentDB M30. The earlier blanket M40 minimum statement is therefore not retained.
 
-## Local is a superset of a small managed cluster
+A local container is not a certification of managed-service support, or vice versa. An index kind rejected by the current server must remain an error; never silently replace it with another kind or report success.
 
-This is the finding that matters, and it runs opposite to the usual assumption
-that the local container is the limited one.
+## Both namespace and thread are filter scopes
 
-HNSW **works locally and fails in the cloud** on M10:
+Per-thread recall filters on both `namespace` and `thread_id`. Schema setup creates ordinary indexes for both filter fields before the vector index. It also creates the shared compound lifecycle indexes described in [SCHEMA_V2.md](SCHEMA_V2.md).
 
-```
-hnsw index is not supported for this cluster tier   (code 115, CommandNotSupported)
-```
+A successful filtered query only constrains the database operation. Your application must separately authenticate and authorize callers before selecting a namespace/thread. Do not let an untrusted request choose arbitrary tenant scopes or supply raw filter objects.
 
-DiskANN fails in both, for different reasons — locally the kind does not exist
-at all (`Invalid search index kind`, tried four spellings), on M10 it is tier-gated
-(`The diskann index is not enabled for this cluster tier`).
+## Setup must be nondestructive
 
-So a green local test suite is **not** evidence that your index kind will deploy.
-The only kind that works in both places is IVF, which is why it is the default
-and why choosing anything else should be a deliberate, tier-aware decision.
+Setup verifies existing index definitions and schema compatibility. It must refuse conflicting vector dimensions/kinds and legacy thread-only uniqueness without dropping or recreating indexes. Use a new database for schema v2 and migrate existing deployments through a separately reviewed process.
 
-These are tier gates, not build flags: no cluster-level setting turns HNSW on at
-M10. `getParameter` is not supported on either deployment, so you cannot probe
-capability that way — attempt the index and handle rejection.
+The relevant index names, options, test deployment and result counts are recorded in the public validation record after live tests. No tier, performance or production-readiness claim follows from local unit tests alone.
 
-## Pre-filtering requires a filter index, created first
+## TLS and lifecycle
 
-Filtered vector search — the "search only this thread's memories" case — needs a
-plain index on the filter field, and it must exist before the search runs:
+Managed Azure connections must verify certificates and hostnames. Explicit local development helpers may trust the local container's self-signed certificate only for loopback addresses; they are not a production TLS configuration.
 
-```
-The index for filter path 'thread_id' was not found,
-please check whether the index is created.
-```
-
-This behaves **identically** on local and managed, including the error text.
-
-Correct order:
-
-```python
-db.command({"createIndexes": "summaries",
-            "indexes": [{"name": "thread_id_filter", "key": {"thread_id": 1}}]})
-# ... then the vector index
-```
-
-A `cosmosSearchOptions` kind of `vector-filter` does **not** exist; the filter
-index is an ordinary B-tree index. `ensure_filter_indexes()` wraps this, and
-`setup()` calls it for the shared schema's filter fields.
-
-Because per-session retrieval is *always* the pre-filter case, adapters create
-these automatically rather than documenting the requirement and hoping.
-
-## Notes
-
-- `:latest` was **0.117.0**, trailing the v1.0-RC1 release. "Latest" is not latest;
-  pin a digest if reproducibility matters.
-- The local container serves TLS with a self-signed cert, so local clients need
-  `tlsAllowInvalidCertificates=true`. The managed service must not use it.
-- Similarity values used: `COS`, `L2`, `IP`. `COS` throughout here.
-
-## Reproducing
-
-```bash
-export DOCUMENTDB_USERNAME=appuser DOCUMENTDB_PASSWORD='...'
-docker compose -f docker/docker-compose.yml up -d
-cd packages/langgraph-checkpoint-documentdb && pytest -q
-```
-
-`test_unsupported_kind_raises_actionable_error` and
-`test_prefilter_without_filter_index_fails` encode the findings above. If either
-starts behaving differently, the platform changed and this document is stale.
+Summary deletion is part of thread deletion in both adapters. Quiesce writers before deleting; whole-thread deletion across collections is not advertised as transactional with concurrent writers. Rerun a failed deletion and check completion rather than claiming an interrupted cleanup erased all records.

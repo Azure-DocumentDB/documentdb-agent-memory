@@ -1,0 +1,153 @@
+{
+  "sessions": [
+    {
+      "name": "memory_v2_sessions_namespace_thread",
+      "key": [
+        [
+          "namespace",
+          1
+        ],
+        [
+          "thread_id",
+          1
+        ]
+      ],
+      "unique": true,
+      "vector": null
+    }
+  ],
+  "messages": [
+    {
+      "name": "memory_v2_messages_namespace_thread_seq",
+      "key": [
+        [
+          "namespace",
+          1
+        ],
+        [
+          "thread_id",
+          1
+        ],
+        [
+          "seq",
+          1
+        ]
+      ],
+      "unique": true,
+      "vector": null
+    }
+  ],
+  "summaries": [
+    {
+      "name": "embedding_vector_ivf",
+      "key": [
+        [
+          "embedding",
+          "cosmosSearch"
+        ]
+      ],
+      "unique": false,
+      "vector": {
+        "kind": "vector-ivf",
+        "similarity": "COS",
+        "dimensions": 3,
+        "numLists": 1
+      }
+    },
+    {
+      "name": "memory_v2_summaries_namespace_thread",
+      "key": [
+        [
+          "namespace",
+          1
+        ],
+        [
+          "thread_id",
+          1
+        ]
+      ],
+      "unique": false,
+      "vector": null
+    },
+    {
+      "name": "namespace_filter",
+      "key": [
+        [
+          "namespace",
+          1
+        ]
+      ],
+      "unique": false,
+      "vector": null
+    },
+    {
+      "name": "thread_id_filter",
+      "key": [
+        [
+          "thread_id",
+          1
+        ]
+      ],
+      "unique": false,
+      "vector": null
+    }
+  ],
+  "checkpoints": [
+    {
+      "name": "memory_v2_checkpoints_namespace_thread_ns_id",
+      "key": [
+        [
+          "namespace",
+          1
+        ],
+        [
+          "thread_id",
+          1
+        ],
+        [
+          "checkpoint_ns",
+          1
+        ],
+        [
+          "checkpoint_id",
+          1
+        ]
+      ],
+      "unique": true,
+      "vector": null
+    }
+  ],
+  "checkpoint_writes": [
+    {
+      "name": "memory_v2_writes_namespace_thread_ns_id_task_idx",
+      "key": [
+        [
+          "namespace",
+          1
+        ],
+        [
+          "thread_id",
+          1
+        ],
+        [
+          "checkpoint_ns",
+          1
+        ],
+        [
+          "checkpoint_id",
+          1
+        ],
+        [
+          "task_id",
+          1
+        ],
+        [
+          "idx",
+          1
+        ]
+      ],
+      "unique": true,
+      "vector": null
+    }
+  ]
+}

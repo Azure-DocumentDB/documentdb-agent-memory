@@ -1,258 +1,287 @@
-"""Integration tests against a real DocumentDB instance.
-
-Run the local container first:
-
-    docker compose -f docker/docker-compose.yml up -d
-
-Config via env:
-    DOCUMENTDB_URI       full connection URI (wins if set)
-    DOCUMENTDB_USERNAME  default "appuser"
-    DOCUMENTDB_PASSWORD  required unless DOCUMENTDB_URI is set
-    DOCUMENTDB_HOST      default 127.0.0.1
-    DOCUMENTDB_PORT      default 10260
-
-Tests skip (not fail) when no instance is reachable, so a plain `pytest` on a
-laptop with nothing running stays green.
-"""
-
-from __future__ import annotations
-
-import os
+"""Real StateGraph contract tests, identical on mongomock and the explicit live gate."""
+from datetime import datetime, timezone
+from typing import Annotated, TypedDict
+import asyncio
+import time
 import uuid
-
 import pytest
-from pymongo.errors import PyMongoError
-
-from langgraph_checkpoint_documentdb import (
-    DEFAULT_KIND,
-    LOCAL_SUPPORTED,
-    MIN_TIER,
-    DocumentDBSaver,
-    MemoryConfig,
-    VectorIndexSpec,
-    VectorIndexUnsupported,
-    build_local_uri,
-    ensure_filter_indexes,
-    ensure_vector_index,
-    vector_search_stage,
-)
-from langgraph_checkpoint_documentdb.schema import SUMMARIES
-
-pytestmark = pytest.mark.integration
-
-DIMS = 8
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver, empty_checkpoint
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.types import Command, interrupt, Send
+from langgraph_checkpoint_documentdb import DocumentDBSaver, MemoryConfig, COLLECTIONS
 
 
-def _uri() -> str | None:
-    if os.environ.get("DOCUMENTDB_URI"):
-        return os.environ["DOCUMENTDB_URI"]
-    pw = os.environ.get("DOCUMENTDB_PASSWORD")
-    if not pw:
-        return None
-    return build_local_uri(
-        os.environ.get("DOCUMENTDB_USERNAME", "appuser"),
-        pw,
-        os.environ.get("DOCUMENTDB_HOST", "127.0.0.1"),
-        int(os.environ.get("DOCUMENTDB_PORT", "10260")),
-    )
+class State(TypedDict):
+    count: int
+    messages: Annotated[list, add_messages]
 
 
-@pytest.fixture(scope="session")
-def saver():
-    uri = _uri()
-    if not uri:
-        pytest.skip("set DOCUMENTDB_URI or DOCUMENTDB_PASSWORD")
-    cfg = MemoryConfig(
-        database=f"test_mem_{uuid.uuid4().hex[:8]}",
-        embedding_dimensions=DIMS,
-        vector_index=VectorIndexSpec(
-            path="embedding", dimensions=DIMS, num_lists=1
-        ),
-    )
-    s = DocumentDBSaver.from_uri(uri, cfg)
-    try:
-        s.client.admin.command("ping")
-    except PyMongoError as exc:
-        pytest.skip(f"no reachable DocumentDB: {exc}")
-    s.setup()
-    yield s
-    s.client.drop_database(cfg.database)
-    s.close()
+def graph(saver, *, paused=False):
+    builder = StateGraph(State)
+    def first(state):
+        return {'count': state['count'] + 1, 'messages': [AIMessage(content='increment')]}
+    def second(state):
+        answer = interrupt('continue?') if paused else 2
+        return {'count': state['count'] + int(answer), 'messages': [AIMessage(content='finish')]}
+    builder.add_node('first', first)
+    builder.add_node('second', second)
+    builder.add_edge(START, 'first')
+    builder.add_edge('first', 'second')
+    builder.add_edge('second', END)
+    return builder.compile(checkpointer=saver)
 
 
-def test_server_is_wire_compatible(saver):
-    info = saver.client.admin.command("buildInfo")
-    hello = saver.client.admin.command("hello")
-    assert info["version"].startswith("7.")
-    assert hello["maxWireVersion"] >= 21
+def config(thread='same', ns='', cid=None):
+    c = {'configurable': {'thread_id': thread, 'checkpoint_ns': ns}, 'metadata': {'owner': 'test'}}
+    if cid:
+        c['configurable']['checkpoint_id'] = cid
+    return c
 
 
-def test_setup_is_idempotent(saver):
-    first = saver.setup()
-    second = saver.setup()
-    assert first["schema_version"] == second["schema_version"]
-    assert second["vector_index"]
+def checkpoint(cid=None, **values):
+    result = empty_checkpoint()
+    if cid:
+        result['id'] = cid
+    result['channel_values'] = values
+    return result
 
 
-def test_put_and_get_roundtrip(saver):
-    tid = f"t-{uuid.uuid4().hex[:8]}"
-    saver.put(tid, "ckpt-1", {"channel_values": {"count": 1}}, {"step": 1})
-    got = saver.get(tid, "ckpt-1")
-    assert got["checkpoint"]["channel_values"]["count"] == 1
-    assert got["metadata"]["step"] == 1
-    saver.delete_thread(tid)
+def test_actual_graph_sync_resume_replay(saver):
+    assert isinstance(saver, BaseCheckpointSaver)
+    app = graph(saver, paused=True)
+    c = config()
+    result = app.invoke({'count': 1, 'messages': [HumanMessage(content='hello')]}, c)
+    assert result['count'] == 2 and result['__interrupt__']
+    paused = app.get_state(c)
+    assert paused.next == ('second',)
+    assert saver.get_tuple(c).pending_writes
+    # New saver/compiled graph retrieves persisted state, not process-local memory.
+    reopened = DocumentDBSaver(saver.client, saver.config)
+    reopened.setup()
+    resumed = graph(reopened, paused=True).invoke(Command(resume=5), c)
+    assert resumed['count'] == 7
+    assert isinstance(resumed['messages'][0], HumanMessage)
+    history = list(app.get_state_history(c))
+    assert len(history) >= 4
+    assert saver.get_tuple(c).parent_config
+    replay_app = graph(reopened, paused=True)
+    replay = replay_app.invoke(None, paused.config)
+    assert replay['count'] == 2 and replay['__interrupt__']
+    assert replay_app.invoke(Command(resume=3), c)['count'] == 5
+    assert saver.get_next_version(None, None) == 1
+    assert saver.get_next_version(3, None) == 4
 
 
-def test_get_latest_without_id(saver):
-    tid = f"t-{uuid.uuid4().hex[:8]}"
-    saver.put(tid, "c1", {"channel_values": {"n": 1}})
-    saver.put(tid, "c2", {"channel_values": {"n": 2}})
-    assert saver.get(tid)["checkpoint"]["channel_values"]["n"] == 2
-    saver.delete_thread(tid)
+async def test_actual_graph_async_resume_replay(saver):
+    app = graph(saver, paused=True)
+    c = config('async')
+    result = await app.ainvoke({'count': 10, 'messages': []}, c)
+    assert result['__interrupt__'] and result['count'] == 11
+    paused = await app.aget_state(c)
+    assert (await app.ainvoke(Command(resume=4), c))['count'] == 15
+    assert (await app.ainvoke(None, paused.config))['__interrupt__']
+    assert (await app.ainvoke(Command(resume=2), c))['count'] == 13
+    assert len([v async for v in saver.alist(c)]) >= 4
+    assert await saver.aget(c)
+    await saver.adelete_thread('async')
+    assert await saver.aget_tuple(c) is None
 
 
-def test_put_is_upsert_not_duplicate(saver):
-    tid = f"t-{uuid.uuid4().hex[:8]}"
-    saver.put(tid, "c1", {"channel_values": {"n": 1}})
-    saver.put(tid, "c1", {"channel_values": {"n": 99}})
-    assert len(list(saver.list(tid))) == 1
-    assert saver.get(tid, "c1")["checkpoint"]["channel_values"]["n"] == 99
-    saver.delete_thread(tid)
+def test_typed_serialization_metadata_parent_and_filters(saver):
+    c = config('serialization')
+    value = {'bytes': b'\x00\xff', 'date': datetime.now(timezone.utc), 'uuid': uuid.uuid4(), 'message': HumanMessage(content='hi'), 'send': Send('node', {'x': 1}), 'set': {1, 2}}
+    first = saver.put(c, checkpoint('001', **value), {'step': 1, 'source': 'input'}, {})
+    second = saver.put(first, checkpoint('002', **value), {'step': 2, 'source': 'loop'}, {})
+    assert saver.get_tuple(second).checkpoint['channel_values'] == value
+    assert saver.get_tuple(second).parent_config == first
+    assert saver.get_tuple(first).metadata['owner'] == 'test'
+    assert [v.checkpoint['id'] for v in saver.list(c)] == ['002', '001']
+    assert [v.checkpoint['id'] for v in saver.list(c, before=second)] == ['001']
+    assert len(list(saver.list(c, filter={'step': 2}, limit=1))) == 1
+    assert len(list(saver.list(c, filter={'step': {'$gt': 0}}))) == 0
+    assert list(saver.list(c, limit=0)) == []
 
 
-def test_threads_are_isolated(saver):
-    a, b = f"a-{uuid.uuid4().hex[:6]}", f"b-{uuid.uuid4().hex[:6]}"
-    saver.put(a, "c1", {"channel_values": {"who": "a"}})
-    saver.put(b, "c1", {"channel_values": {"who": "b"}})
-    assert saver.get(a, "c1")["checkpoint"]["channel_values"]["who"] == "a"
-    assert saver.get(b, "c1")["checkpoint"]["channel_values"]["who"] == "b"
-    assert len(list(saver.list(a))) == 1
-    saver.delete_thread(a)
-    saver.delete_thread(b)
+def test_pending_write_first_wins_special_channels_and_task_path_order(saver):
+    c = saver.put(config(), checkpoint('writes'), {'step': 0}, {})
+    saver.put_writes(c, [('x', 1), ('x', 2)], 'task-a', 'z')
+    saver.put_writes(c, [('x', 999), ('x', 999)], 'task-a', 'z')
+    saver.put_writes(c, [('__error__', 'old')], 'task-a', 'z')
+    saver.put_writes(c, [('__error__', 'new')], 'task-a', 'z')
+    saver.put_writes(c, [('x', 3)], 'task-z', 'a')
+    assert saver.get_tuple(c).pending_writes == [('task-z', 'x', 3), ('task-a', '__error__', 'new'), ('task-a', 'x', 1), ('task-a', 'x', 2)]
+    for channel in ('__scheduled__', '__interrupt__', '__resume__'):
+        saver.put_writes(c, [(channel, 1)], 'special', 'b')
+        saver.put_writes(c, [(channel, 2)], 'special', 'b')
+    assert len([w for w in saver.get_tuple(c).pending_writes if w[0] == 'special']) == 3
+    assert all(w[2] == 2 for w in saver.get_tuple(c).pending_writes if w[0] == 'special')
 
 
-def test_writes_roundtrip_in_order(saver):
-    tid = f"t-{uuid.uuid4().hex[:8]}"
-    saver.put(tid, "c1", {"channel_values": {}})
-    saver.put_writes(tid, "c1", "task-1", [("messages", "hello"), ("messages", "world")])
-    writes = saver.get_writes(tid, "c1")
-    assert [w["value"] for w in writes] == ["hello", "world"]
-    assert [w["idx"] for w in writes] == [0, 1]
-    saver.delete_thread(tid)
+def test_storage_and_checkpoint_namespaces_and_delete_all_five(saver):
+    other = DocumentDBSaver(saver.client, MemoryConfig(database=saver.config.database, namespace=saver.config.namespace + '-other', embedding_dimensions=3))
+    other.setup()
+    for adapter, label in [(saver, 'A'), (other, 'B')]:
+        for ns in ('', 'subgraph'):
+            c = adapter.put(config(ns=ns), checkpoint('same-id', label=label, ns=ns), {}, {})
+            adapter.put_writes(c, [('x', label)], 'task')
+        for collection in ('messages', 'summaries'):
+            adapter.db[collection].insert_one({'namespace': adapter.config.namespace, 'thread_id': 'same', 'seq': 1, 'text': label})
+    assert saver.get(config())['channel_values']['label'] == 'A'
+    assert other.get(config())['channel_values']['label'] == 'B'
+    assert saver.get(config(ns='subgraph'))['channel_values']['ns'] == 'subgraph'
+    assert len(list(saver.list(None))) == 2
+    saver.db.sessions.update_one({'namespace': saver.config.namespace, 'thread_id': 'same'}, {'$set': {'next_seq': 91}})
+    saver.put(config(), checkpoint('same-id', label='A'), {}, {})
+    assert saver.db.sessions.find_one({'namespace': saver.config.namespace, 'thread_id': 'same'})['next_seq'] == 91
+    counts = saver.delete_thread_counts('same')
+    assert set(counts) == set(COLLECTIONS) and all(v > 0 for v in counts.values())
+    assert all(saver.db[name].count_documents({'namespace': saver.config.namespace, 'thread_id': 'same'}) == 0 for name in COLLECTIONS)
+    assert all(saver.db[name].count_documents({'namespace': other.config.namespace, 'thread_id': 'same'}) > 0 for name in COLLECTIONS)
 
 
-def test_delete_thread_removes_everything(saver):
-    tid = f"t-{uuid.uuid4().hex[:8]}"
-    saver.put(tid, "c1", {"channel_values": {}})
-    saver.put_writes(tid, "c1", "task-1", [("messages", "x")])
-    counts = saver.delete_thread(tid)
-    assert counts["checkpoints"] == 1
-    assert counts["writes"] == 1
-    assert saver.get(tid, "c1") is None
+@pytest.mark.parametrize('field', ['thread_id', 'checkpoint_ns', 'checkpoint_id'])
+def test_operator_input_rejected(saver, field):
+    c = config(cid='id')
+    c['configurable'][field] = {'$ne': None}
+    with pytest.raises(ValueError):
+        saver.get_tuple(c)
+    with pytest.raises(ValueError):
+        saver.put(c, checkpoint(), {}, {})
+    with pytest.raises(ValueError):
+        saver.delete_thread({'$ne': None})
 
 
-# --- vector behavior: the Phase 0 findings, locked in --------------------------
+def test_close_and_secure_serializer(saver):
+    with pytest.raises(NotImplementedError):
+        saver.serde.loads_typed(('pickle', b'unsafe'))
+    assert saver.serde._allowed_msgpack_modules is None
+    saver.close()
+    saver.close()
+    with pytest.raises(RuntimeError, match='closed'):
+        saver.get_tuple(config())
 
 
-def test_default_kind_is_ivf():
-    """IVF is the only kind that works on both local and the entry managed tier."""
-    assert DEFAULT_KIND == "vector-ivf"
-    assert LOCAL_SUPPORTED["vector-ivf"] is True
-    assert MIN_TIER["vector-ivf"] == "M10"
+async def test_async_does_not_block_event_loop(saver, monkeypatch):
+    original = saver.get_tuple
+    def slow(c):
+        time.sleep(0.08)
+        return original(c)
+    monkeypatch.setattr(saver, 'get_tuple', slow)
+    task = asyncio.create_task(saver.aget_tuple(config()))
+    await asyncio.sleep(0.01)
+    assert not task.done()
+    await task
 
 
-def test_vector_search_returns_ranked_results(saver):
-    db = saver.db
-    col = db[SUMMARIES]
-    tid = f"v-{uuid.uuid4().hex[:8]}"
-    col.insert_many(
-        [
-            {
-                "thread_id": tid,
-                "namespace": "default",
-                "text": f"summary {i}",
-                "embedding": [float(i)] * DIMS,
-            }
-            for i in range(5)
-        ]
-    )
-    stage = vector_search_stage(vector=[0.0] * DIMS, path="embedding", k=3)
-    results = list(col.aggregate([stage, {"$project": {"text": 1, "_id": 0}}]))
-    assert len(results) == 3
-    col.delete_many({"thread_id": tid})
+def test_uninitialized_saver_fails_closed(saver):
+    unready = DocumentDBSaver(saver.client, saver.config)
+    with pytest.raises(RuntimeError, match='setup'):
+        unready.put(config(), checkpoint(), {}, {})
+    with pytest.raises(RuntimeError, match='setup'):
+        list(unready.list(None))
 
 
-def test_prefiltered_search_is_scoped_to_thread(saver):
-    """Per-session retrieval -- the case that needs a filter index to exist."""
-    db = saver.db
-    col = db[SUMMARIES]
-    keep, other = f"k-{uuid.uuid4().hex[:6]}", f"o-{uuid.uuid4().hex[:6]}"
-    col.insert_many(
-        [
-            {"thread_id": keep, "namespace": "default", "embedding": [0.1] * DIMS},
-            {"thread_id": keep, "namespace": "default", "embedding": [0.2] * DIMS},
-            {"thread_id": other, "namespace": "default", "embedding": [0.1] * DIMS},
-        ]
-    )
-    stage = vector_search_stage(
-        vector=[0.1] * DIMS,
-        path="embedding",
-        k=10,
-        filter={"thread_id": {"$eq": keep}},
-    )
-    results = list(col.aggregate([stage, {"$project": {"thread_id": 1, "_id": 0}}]))
-    assert results, "pre-filtered search returned nothing"
-    assert all(r["thread_id"] == keep for r in results)
-    col.delete_many({"thread_id": {"$in": [keep, other]}})
+def test_injected_client_ownership(saver):
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    caller_owned = DocumentDBSaver(client)
+    caller_owned.close()
+    client.close.assert_not_called()
+    owned = DocumentDBSaver(client, owns_client=True)
+    owned.close()
+    owned.close()
+    client.close.assert_called_once()
 
 
-def test_prefilter_without_filter_index_fails(saver):
-    """Guards the footgun: filtering an unindexed field is a server error.
-
-    If this ever starts passing, pre-filtering stopped requiring a filter index
-    and ensure_filter_indexes() can be revisited.
-    """
-    db = saver.db
-    name = f"nofilter_{uuid.uuid4().hex[:8]}"
-    db.create_collection(name)
-    col = db[name]
-    col.insert_many(
-        [{"unindexed_field": "x", "embedding": [0.1] * DIMS} for _ in range(3)]
-    )
-    ensure_vector_index(
-        db, name, VectorIndexSpec(path="embedding", dimensions=DIMS, num_lists=1)
-    )
-    stage = vector_search_stage(
-        vector=[0.1] * DIMS,
-        path="embedding",
-        k=3,
-        filter={"unindexed_field": {"$eq": "x"}},
-    )
-    with pytest.raises(PyMongoError, match="index for filter path"):
-        list(col.aggregate([stage]))
-    db.drop_collection(name)
+def test_real_nested_graph_checkpoint_namespace(saver):
+    child = graph(saver, paused=True)
+    builder = StateGraph(State)
+    builder.add_node('child', child)
+    builder.add_edge(START, 'child')
+    builder.add_edge('child', END)
+    app = builder.compile(checkpointer=saver)
+    c = config('nested')
+    assert app.invoke({'count': 1, 'messages': []}, c)['__interrupt__']
+    assert app.invoke(Command(resume=4), c)['count'] == 6
+    rows = list(saver.list({'configurable': {'thread_id': 'nested'}}))
+    assert any(v.config['configurable']['checkpoint_ns'].startswith('child:') for v in rows)
+    assert any(v.config['configurable']['checkpoint_ns'] == '' for v in rows)
 
 
-def test_ensure_filter_indexes_is_idempotent(saver):
-    ensure_filter_indexes(saver.db, SUMMARIES, ["thread_id"])
-    ensure_filter_indexes(saver.db, SUMMARIES, ["thread_id"])
+def test_actual_graph_failure_resumes_without_rerunning_successful_sibling(saver):
+    import operator
+    class ParallelState(TypedDict):
+        values: Annotated[list, operator.add]
+    calls = {'good': 0, 'flaky': 0}
+    def good(state):
+        calls['good'] += 1
+        return {'values': ['good']}
+    def flaky(state):
+        calls['flaky'] += 1
+        if calls['flaky'] == 1:
+            raise RuntimeError('synthetic retryable failure')
+        return {'values': ['flaky']}
+    builder = StateGraph(ParallelState)
+    builder.add_node('good', good)
+    builder.add_node('flaky', flaky)
+    builder.add_edge(START, 'good')
+    builder.add_edge(START, 'flaky')
+    builder.add_edge('good', END)
+    builder.add_edge('flaky', END)
+    app = builder.compile(checkpointer=saver)
+    c = config('failure')
+    with pytest.raises(RuntimeError, match='synthetic'):
+        app.invoke({'values': []}, c)
+    assert any(w[1] == '__error__' for w in saver.get_tuple(c).pending_writes)
+    assert sorted(app.invoke(None, c)['values']) == ['flaky', 'good']
+    assert calls == {'good': 1, 'flaky': 2}
 
 
-def test_unsupported_kind_raises_actionable_error(saver):
-    """HNSW/DiskANN rejection must name the required tier, not just echo the server."""
-    db = saver.db
-    name = f"tier_{uuid.uuid4().hex[:8]}"
-    db.create_collection(name)
-    unsupported = []
-    for kind in ("vector-hnsw", "vector-diskann"):
-        try:
-            ensure_vector_index(
-                db, name, VectorIndexSpec(path="embedding", dimensions=DIMS, kind=kind)
-            )
-        except VectorIndexUnsupported as exc:
-            unsupported.append(kind)
-            assert MIN_TIER[kind] in str(exc)
-            assert DEFAULT_KIND in str(exc)
-    db.drop_collection(name)
-    if not unsupported:
-        pytest.skip("this deployment supports every vector index kind")
+def test_concurrent_pending_writes_are_idempotent(saver):
+    from concurrent.futures import ThreadPoolExecutor
+    c = saver.put(config('concurrent'), checkpoint('concurrent-id'), {}, {})
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda _: saver.put_writes(c, [('value', 'stable')], 'same-task'), range(24)))
+    assert saver.get_tuple(c).pending_writes == [('same-task', 'value', 'stable')]
+
+
+def test_write_input_validation_is_before_mutation(saver):
+    c = saver.put(config('validated'), checkpoint('validated-id'), {}, {})
+    with pytest.raises(ValueError):
+        saver.put_writes(c, [('safe', 1), ({'$ne': None}, 2)], 'task')
+    assert saver.get_tuple(c).pending_writes == []
+    bad = checkpoint()
+    bad['id'] = {'$ne': None}
+    with pytest.raises(ValueError):
+        saver.put(config('validated'), bad, {}, {})
+    assert len(list(saver.list(config('validated')))) == 1
+
+
+from dataclasses import dataclass
+
+@dataclass
+class CustomState:
+    x: int
+
+
+def test_nonallowlisted_custom_state_fails_before_write(saver):
+    from dataclasses import make_dataclass
+    Custom = make_dataclass('UnsafeState', [('x', int)])
+    with pytest.raises(ValueError, match='strict serializer'):
+        saver.put(config('custom'), checkpoint('custom-id', custom=Custom(1)), {}, {})
+    assert saver.get_tuple(config('custom')) is None
+
+
+def test_explicit_trusted_custom_type_allowlist(saver):
+    trusted = saver.with_allowlist({(__name__, 'CustomState')})
+    c = trusted.put(config('trusted'), checkpoint('trusted-id', custom=CustomState(3)), {}, {})
+    assert trusted.get(c)['channel_values']['custom'] == CustomState(3)
+
+
+async def test_async_close(saver):
+    await saver.aclose()
+    await saver.aclose()
+    with pytest.raises(RuntimeError, match='closed'):
+        await saver.aget_tuple(config())

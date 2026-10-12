@@ -1,38 +1,6 @@
-/** Vercel AI SDK memory adapter backed by Azure DocumentDB. */
-
-export {
-  DocumentDBMemory,
-  buildLocalUri,
-  type StoredMessage,
-  type SummaryHit,
-} from "./memory.js";
-
-export {
-  FILTER_FIELDS,
-  MESSAGES,
-  SCHEMA_VERSION,
-  SESSIONS,
-  SUMMARIES,
-  ensureSchema,
-  resolveConfig,
-  utcNow,
-  type MemoryConfig,
-  type ResolvedMemoryConfig,
-  type SchemaReport,
-} from "./schema.js";
-
-export {
-  DEFAULT_KIND,
-  LOCAL_SUPPORTED,
-  MIN_TIER,
-  VectorIndexUnsupportedError,
-  cosmosSearchOptions,
-  ensureFilterIndexes,
-  ensureVectorIndex,
-  vectorSearchStage,
-  type Similarity,
-  type VectorIndexSpec,
-  type VectorKind,
-} from "./vector.js";
-
+/** Application-level AI SDK message memory. Not an official plugin or auto-attached memory. */
+export * from "./memory.js";
+export * from "./schema.js";
+export * from "./vector.js";
+export * from "./auth.js";
 export const VERSION = "0.1.0";
